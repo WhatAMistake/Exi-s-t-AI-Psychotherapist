@@ -1,0 +1,208 @@
+import os
+import torch
+from datasets import Dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    TrainingArguments,
+    Trainer
+)
+from peft import LoraConfig, get_peft_model
+from bs4 import BeautifulSoup
+import re
+
+# Фикс для MacOS Intel
+os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
+
+# 1. Конфигурация
+EPUB_DIR = os.path.expanduser("~/exist_train")  # Папка с книгами
+CHUNK_SIZE = 512
+MAX_SAMPLES = 5000
+
+# Создаем папку, если её нет
+os.makedirs(EPUB_DIR, exist_ok=True)
+print(f"EPUB-файлы должны быть размещены в: {EPUB_DIR}")
+
+# 2. Функция для конвертации EPUB в текст
+def epub_to_text(path):
+    try:
+        import zipfile
+        import xml.etree.ElementTree as ET
+        from bs4 import BeautifulSoup
+        import re
+        import os
+        
+        # Пространства имён EPUB
+        ns = {
+            'n': 'urn:oasis:names:tc:opendocument:xmlns:container',
+            'opf': 'http://www.idpf.org/2007/opf'
+        }
+        
+        full_text = []
+        
+        with zipfile.ZipFile(path) as z:
+            # Проверяем наличие необходимых файлов
+            if 'mimetype' not in z.namelist() or z.read('mimetype').decode() != 'application/epub+zip':
+                print(f"  {os.path.basename(path)} не является валидным EPUB-файлом")
+                return ""
+                
+            # Получаем корневой файл из container.xml
+            container = ET.fromstring(z.read('META-INF/container.xml'))
+            rootfile = container.find('.//n:rootfile', ns)
+            if rootfile is None:
+                print(f"  Не найден rootfile в {os.path.basename(path)}")
+                return ""
+                
+            opf_path = rootfile.attrib['full-path']
+            opf_dir = os.path.dirname(opf_path)
+            
+            # Парсим OPF-файл
+            opf = ET.fromstring(z.read(opf_path))
+            manifest = opf.find('opf:manifest', ns)
+            if manifest is None:
+                print(f"  Не найден manifest в {os.path.basename(path)}")
+                return ""
+                
+            # Ищем все HTML/XML-файлы
+            html_files = []
+            for item in manifest.findall('opf:item', ns):
+                if item.attrib['media-type'] in ['application/xhtml+xml', 'text/html']:
+                    html_files.append(os.path.join(opf_dir, item.attrib['href']))
+            
+            # Обрабатываем каждый HTML-файл
+            for html_file in html_files:
+                try:
+                    content = z.read(html_file)
+                    soup = BeautifulSoup(content, 'html.parser')
+                    text = soup.get_text()
+                    
+                    # Улучшенная очистка текста
+                    text = re.sub(r'\s+', ' ', text)  # Убираем лишние пробелы
+                    text = re.sub(r'[^\w\s.,!?;:—–-]', '', text)  # Сохраняем основные пунктуационные знаки
+                    text = text.strip()
+                    
+                    if text:
+                        full_text.append(text)
+                except Exception as e:
+                    print(f"  Ошибка обработки {html_file}: {str(e)}")
+        
+        return " ".join(full_text)
+    except Exception as e:
+        print(f"Ошибка чтения {os.path.basename(path)}: {str(e)}")
+        return ""
+
+# 3. Загрузка и обработка EPUB-файлов
+def load_epub_dataset():
+    chunks = []
+    
+    # Проверка наличия файлов
+    epub_files = [f for f in os.listdir(EPUB_DIR) if f.lower().endswith('.epub')]
+    if not epub_files:
+        raise FileNotFoundError(f"В папке {EPUB_DIR} не найдено EPUB-файлов!")
+    
+    print(f"Найдено {len(epub_files)} EPUB-файлов для обработки")
+    
+    for filename in epub_files:
+        filepath = os.path.join(EPUB_DIR, filename)
+        print(f"Обработка: {filename}")
+        
+        text = epub_to_text(filepath)
+        if not text:
+            print(f"  Пропущен (пустой текст): {filename}")
+            continue
+            
+        # Разбиваем текст на фрагменты
+        for i in range(0, len(text), CHUNK_SIZE):
+            chunk = text[i:i+CHUNK_SIZE]
+            if len(chunk) > 100:
+                chunks.append({"text": chunk})
+                
+            if len(chunks) >= MAX_SAMPLES:
+                break
+                
+        print(f"  Добавлено фрагментов: {min(len(text)//CHUNK_SIZE, MAX_SAMPLES - len(chunks))}")
+        
+        if len(chunks) >= MAX_SAMPLES:
+            print(f"Достигнут максимум в {MAX_SAMPLES} фрагментов")
+            break
+    
+    print(f"Итого создано {len(chunks)} текстовых фрагментов")
+    return Dataset.from_list(chunks)
+
+# 4. Загрузка токенизатора для falcon3-3b-base - ИЗМЕНЕНИЕ ЗДЕСЬ
+tokenizer = tokenizer = AutoTokenizer.from_pretrained("tiiuae/Falcon3-3B-Base")
+tokenizer.pad_token = tokenizer.eos_token
+
+# 5. Подготовка датасета
+print("\nПодготовка датасета...")
+dataset = load_epub_dataset()
+
+def tokenize_function(examples):
+    return tokenizer(
+        examples["text"],
+        truncation=True,
+        max_length=256,
+        padding="max_length",
+        return_tensors="pt"
+    )
+
+tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
+
+# 6. Загрузка модели falcon3-3b-base 
+print("\nЗагрузка модели Falcon3-3B-Base...")
+model = AutoModelForCausalLM.from_pretrained("tiiuae/Falcon3-3B-Base")
+
+# 7. Настройка LoRA
+peft_config = LoraConfig(
+    r=8,
+    lora_alpha=32,
+    target_modules=["query_key_value"],
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM"
+)
+
+model = get_peft_model(model, peft_config)
+
+# 8. Параметры обучения
+training_args = TrainingArguments(
+    output_dir="./falcon3-3b-base-trained", 
+    per_device_train_batch_size=2,
+    gradient_accumulation_steps=4,
+    num_train_epochs=3,
+    learning_rate=2e-5,
+    optim="adamw_torch",
+    fp16=True,
+    logging_steps=50,
+    save_strategy="epoch",
+    report_to="none",
+    remove_unused_columns=False
+)
+
+# 9. Запуск обучения
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=tokenized_dataset,
+)
+
+print("\nСтарт обучения модели Falcon3-3B-Base...")
+trainer.train()
+
+# 10. Сохранение
+model.save_pretrained("./falcon3-3b-base-trained")
+tokenizer.save_pretrained("./falcon3-3b-base-trained")
+print("Модель сохранена в './falcon3-3b-base-trained'")
+
+# 11. Тестирование
+input_text = "Главный герой романа"
+inputs = tokenizer(input_text, return_tensors="pt").to(model.device)
+outputs = model.generate(
+    **inputs, 
+    max_new_tokens=100,
+    temperature=0.7,
+    do_sample=True,
+    pad_token_id=tokenizer.eos_token_id  # Важно для Falcon
+)
+print("\nРезультат генерации:")
+print(tokenizer.decode(outputs[0], skip_special_tokens=True))
