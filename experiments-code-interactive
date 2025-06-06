@@ -1,0 +1,54 @@
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import re
+
+# Загрузка модели
+model_path = "./rugpt3small-trained"
+model = AutoModelForCausalLM.from_pretrained(model_path)
+tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+# Настройки генерации
+generation_config = {
+    "max_new_tokens": 150,
+    "do_sample": True,
+    "temperature": 0.7,
+    "top_k": 40,
+    "top_p": 0.8,
+    "repetition_penalty": 1.5,
+    "no_repeat_ngram_size": 3,
+}
+
+# Функция для очистки ответа
+def clean_response(text):
+    text = re.sub(r'^[—\-«"]+', '', text)  # Удаляем стартовые тире/кавычки
+    text = text.split("\n")[0].strip()      # Берем первую строку
+    return text
+
+# Диалоговый цикл
+def run_chat():
+    print("Привет! Давай поговорим. Напиши 'стоп' чтобы выйти.\n")
+    history = []
+    
+    while True:
+        user_input = input("Ты: ")
+        if user_input.lower() in ["стоп", "stop", "выход"]:
+            print("Бот: Пока!")
+            break
+            
+        # Формируем промпт с историей
+        history.append(f"Пользователь: {user_input}")
+        prompt = "\n".join(history[-4:]) + "\nБот:"  # Берем последние 4 реплики
+        
+        # Генерация ответа
+        inputs = tokenizer(prompt, return_tensors="pt")
+        output = model.generate(**inputs, **generation_config)
+        bot_response = tokenizer.decode(output[0], skip_special_tokens=True)
+        
+        # Извлекаем только новый ответ (без истории)
+        bot_response = bot_response[len(prompt):]
+        bot_response = clean_response(bot_response)
+        
+        print(f"Бот: {bot_response}")
+        history.append(f"Бот: {bot_response}")
+
+# Запуск чата
+run_chat()
