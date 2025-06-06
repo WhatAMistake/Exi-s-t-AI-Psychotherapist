@@ -17,10 +17,9 @@ import sys
 # 1. Конфигурация
 EPUB_DIR = os.path.expanduser("~/exist_train")  # Папка с книгами
 CHUNK_SIZE = 512
-MAX_SAMPLES = 1000
+MAX_SAMPLES = 16384
 MODEL_NAME = "ai-forever/rugpt3small_based_on_gpt2"  
 
-os.makedirs(EPUB_DIR, exist_ok=True)
 print(f"EPUB-файлы должны быть размещены в: {EPUB_DIR}")
 
 # 2. Функция для конвертации EPUB в текст
@@ -84,7 +83,7 @@ def epub_to_text(path):
         print(f"Ошибка чтения {os.path.basename(path)}: {str(e)}")
         return ""
 
-# 3. Загрузка и обработка EPUB-файлов (без изменений)
+# 3. Загрузка и обработка EPUB-файлов
 def load_epub_dataset():
     chunks = []
     
@@ -122,12 +121,12 @@ def load_epub_dataset():
     print(f"Итого создано {len(chunks)} текстовых фрагментов")
     return Dataset.from_list(chunks)
 
-# 4. Загрузка токенизатора
+# 4. Загрузка токенизатора (изменили модель)
 print("\nЗагрузка токенизатора...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-tokenizer.pad_token = tokenizer.eos_token  # GPT-3 использует eos_token как pad_token
+tokenizer.pad_token = tokenizer.eos_token 
 
-# 5. Подготовка датасета 
+# 5. Подготовка датасета (без изменений)
 print("\nПодготовка датасета...")
 dataset = load_epub_dataset()
 
@@ -162,9 +161,9 @@ peft_config = LoraConfig(
     r=8,
     lora_alpha=32,
     target_modules=[
-        "c_attn",  
+        "c_attn", 
         "c_proj",  
-        "c_fc",  
+        "c_fc",    
         "mlp.c_proj" 
     ],
     lora_dropout=0.05,
@@ -207,7 +206,7 @@ tokenizer.save_pretrained("./rugpt3small-trained")
 print("Модель сохранена в './rugpt3small-trained'")
 
 # 12. Тестирование
-input_text = "Главный герой романа"
+input_text = "В чём смысл жизни?"
 inputs = tokenizer(input_text, return_tensors="pt").to("cuda" if torch.cuda.is_available() else "cpu")
 outputs = model.generate(
     **inputs,
