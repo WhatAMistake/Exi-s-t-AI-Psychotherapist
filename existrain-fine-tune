@@ -5,21 +5,21 @@ from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
     TrainingArguments,
-    Trainer
+    Trainer,
+    BitsAndBytesConfig
 )
 from peft import LoraConfig, get_peft_model
 from bs4 import BeautifulSoup
 import re
-
-# Фикс для MacOS Intel
-os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
+import signal
+import sys
 
 # 1. Конфигурация
 EPUB_DIR = os.path.expanduser("~/exist_train")  # Папка с книгами
 CHUNK_SIZE = 512
-MAX_SAMPLES = 5000
+MAX_SAMPLES = 1000
+MODEL_NAME = "ai-forever/rugpt3small_based_on_gpt2"  
 
-# Создаем папку, если её нет
 os.makedirs(EPUB_DIR, exist_ok=True)
 print(f"EPUB-файлы должны быть размещены в: {EPUB_DIR}")
 
@@ -32,7 +32,6 @@ def epub_to_text(path):
         import re
         import os
         
-        # Пространства имён EPUB
         ns = {
             'n': 'urn:oasis:names:tc:opendocument:xmlns:container',
             'opf': 'http://www.idpf.org/2007/opf'
@@ -41,12 +40,10 @@ def epub_to_text(path):
         full_text = []
         
         with zipfile.ZipFile(path) as z:
-            # Проверяем наличие необходимых файлов
             if 'mimetype' not in z.namelist() or z.read('mimetype').decode() != 'application/epub+zip':
                 print(f"  {os.path.basename(path)} не является валидным EPUB-файлом")
                 return ""
                 
-            # Получаем корневой файл из container.xml
             container = ET.fromstring(z.read('META-INF/container.xml'))
             rootfile = container.find('.//n:rootfile', ns)
             if rootfile is None:
@@ -56,29 +53,25 @@ def epub_to_text(path):
             opf_path = rootfile.attrib['full-path']
             opf_dir = os.path.dirname(opf_path)
             
-            # Парсим OPF-файл
             opf = ET.fromstring(z.read(opf_path))
             manifest = opf.find('opf:manifest', ns)
             if manifest is None:
                 print(f"  Не найден manifest в {os.path.basename(path)}")
                 return ""
                 
-            # Ищем все HTML/XML-файлы
             html_files = []
             for item in manifest.findall('opf:item', ns):
                 if item.attrib['media-type'] in ['application/xhtml+xml', 'text/html']:
                     html_files.append(os.path.join(opf_dir, item.attrib['href']))
             
-            # Обрабатываем каждый HTML-файл
             for html_file in html_files:
                 try:
                     content = z.read(html_file)
                     soup = BeautifulSoup(content, 'html.parser')
                     text = soup.get_text()
                     
-                    # Улучшенная очистка текста
-                    text = re.sub(r'\s+', ' ', text)  # Убираем лишние пробелы
-                    text = re.sub(r'[^\w\s.,!?;:—–-]', '', text)  # Сохраняем основные пунктуационные знаки
+                    text = re.sub(r'\s+', ' ', text)
+                    text = re.sub(r'[^\w\s.,!?;:—–-]', '', text)
                     text = text.strip()
                     
                     if text:
@@ -91,11 +84,10 @@ def epub_to_text(path):
         print(f"Ошибка чтения {os.path.basename(path)}: {str(e)}")
         return ""
 
-# 3. Загрузка и обработка EPUB-файлов
+# 3. Загрузка и обработка EPUB-файлов (без изменений)
 def load_epub_dataset():
     chunks = []
     
-    # Проверка наличия файлов
     epub_files = [f for f in os.listdir(EPUB_DIR) if f.lower().endswith('.epub')]
     if not epub_files:
         raise FileNotFoundError(f"В папке {EPUB_DIR} не найдено EPUB-файлов!")
@@ -111,7 +103,6 @@ def load_epub_dataset():
             print(f"  Пропущен (пустой текст): {filename}")
             continue
             
-        # Разбиваем текст на фрагменты
         for i in range(0, len(text), CHUNK_SIZE):
             chunk = text[i:i+CHUNK_SIZE]
             if len(chunk) > 100:
@@ -125,84 +116,105 @@ def load_epub_dataset():
         if len(chunks) >= MAX_SAMPLES:
             print(f"Достигнут максимум в {MAX_SAMPLES} фрагментов")
             break
-    
+        if sys.getsizeof(chunks) > 1_000_000_000:
+            print(f"Превышен лимит памяти. Используется первых {len(chunks)//2} фрагментов")
+
     print(f"Итого создано {len(chunks)} текстовых фрагментов")
     return Dataset.from_list(chunks)
 
-# 4. Загрузка токенизатора для falcon3-3b-base - ИЗМЕНЕНИЕ ЗДЕСЬ
-tokenizer = tokenizer = AutoTokenizer.from_pretrained("tiiuae/Falcon3-3B-Base")
-tokenizer.pad_token = tokenizer.eos_token
+# 4. Загрузка токенизатора
+print("\nЗагрузка токенизатора...")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+tokenizer.pad_token = tokenizer.eos_token  # GPT-3 использует eos_token как pad_token
 
-# 5. Подготовка датасета
+# 5. Подготовка датасета 
 print("\nПодготовка датасета...")
 dataset = load_epub_dataset()
 
 def tokenize_function(examples):
-    return tokenizer(
+    tokenized = tokenizer(
         examples["text"],
         truncation=True,
         max_length=256,
         padding="max_length",
         return_tensors="pt"
     )
+    tokenized["labels"] = tokenized["input_ids"].clone() 
+    return tokenized
 
 tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
 
-# 6. Загрузка модели falcon3-3b-base 
-print("\nЗагрузка модели Falcon3-3B-Base...")
-model = AutoModelForCausalLM.from_pretrained("tiiuae/Falcon3-3B-Base")
 
-# 7. Настройка LoRA
+# 6. Конфигурация Quantization
+quant_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_use_double_quant=False
+)
+
+# 7. Загрузка модели
+print(f"\nЗагрузка модели {MODEL_NAME}...")
+model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, device_map="auto")
+
+# 8. Настройка LoRA для GPT-3
 peft_config = LoraConfig(
     r=8,
     lora_alpha=32,
-    target_modules=["query_key_value"],
+    target_modules=[
+        "c_attn",  
+        "c_proj",  
+        "c_fc",  
+        "mlp.c_proj" 
+    ],
     lora_dropout=0.05,
     bias="none",
     task_type="CAUSAL_LM"
 )
 
 model = get_peft_model(model, peft_config)
+model.print_trainable_parameters()
 
-# 8. Параметры обучения
+# 9. Параметры обучения
 training_args = TrainingArguments(
-    output_dir="./falcon3-3b-base-trained", 
+    output_dir="./rugpt3small-trained",
     per_device_train_batch_size=2,
-    gradient_accumulation_steps=4,
+    gradient_accumulation_steps=2,
     num_train_epochs=3,
     learning_rate=2e-5,
     optim="adamw_torch",
-    fp16=True,
-    logging_steps=50,
-    save_strategy="epoch",
+    logging_steps=10,
+    save_strategy="steps",
+    save_steps=200,
     report_to="none",
-    remove_unused_columns=False
+    remove_unused_columns=False,
+    fp16=True if torch.cuda.is_available() else False
 )
 
-# 9. Запуск обучения
+# 10. Запуск обучения
 trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=tokenized_dataset,
 )
 
-print("\nСтарт обучения модели Falcon3-3B-Base...")
+print("\nСтарт обучения модели...")
 trainer.train()
 
-# 10. Сохранение
-model.save_pretrained("./falcon3-3b-base-trained")
-tokenizer.save_pretrained("./falcon3-3b-base-trained")
-print("Модель сохранена в './falcon3-3b-base-trained'")
+# 11. Сохранение
+model.save_pretrained("./rugpt3small-trained")
+tokenizer.save_pretrained("./rugpt3small-trained")
+print("Модель сохранена в './rugpt3small-trained'")
 
-# 11. Тестирование
+# 12. Тестирование
 input_text = "Главный герой романа"
-inputs = tokenizer(input_text, return_tensors="pt").to(model.device)
+inputs = tokenizer(input_text, return_tensors="pt").to("cuda" if torch.cuda.is_available() else "cpu")
 outputs = model.generate(
-    **inputs, 
-    max_new_tokens=100,
+    **inputs,
+    max_new_tokens=50,
     temperature=0.7,
     do_sample=True,
-    pad_token_id=tokenizer.eos_token_id  # Важно для Falcon
+    pad_token_id=tokenizer.eos_token_id
 )
 print("\nРезультат генерации:")
 print(tokenizer.decode(outputs[0], skip_special_tokens=True))
