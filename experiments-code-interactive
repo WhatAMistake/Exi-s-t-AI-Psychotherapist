@@ -6,15 +6,47 @@ model_path = "./rugpt3small-trained"
 model = AutoModelForCausalLM.from_pretrained(model_path)
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 
-# Настройки генерации
+class ImprovedStopCriteria(StoppingCriteria):
+    def __init__(self, tokenizer, min_length=20, max_length=100, stop_sequences=["\n\n", "###"]):
+        self.tokenizer = tokenizer
+        self.min_length = min_length  # Минимум слов/токенов для генерации
+        self.max_length = max_length
+        self.stop_sequences = stop_sequences
+        
+    def __call__(self, input_ids, scores, **kwargs):
+        current_text = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
+        
+        # 1. Не останавливаемся раньше min_length
+        if input_ids.shape[1] < self.min_length:
+            return False
+            
+        # 2. Проверка стоп-последовательностей (только в конце текста)
+        if any(current_text.rstrip().endswith(seq) for seq in self.stop_sequences):
+            return True
+            
+        # 3. Останавливаемся на естественных границах (но только после разумной длины)
+        last_char = current_text.rstrip()[-1] if current_text.rstrip() else ''
+        if input_ids.shape[1] > self.min_length and last_char in {'.', '?', '!'}:
+            return True
+            
+        # 4. Fallback: максимальная длина
+        if input_ids.shape[1] >= self.max_length:
+            return True
+            
+        return False
+
 generation_config = {
-    "max_new_tokens": 150,
+    "max_new_tokens": 150, 
     "do_sample": True,
-    "temperature": 0.7,
-    "top_k": 40,
-    "top_p": 0.8,
+    "temperature": 0.5,
+    "top_k": 30,
+    "top_p": 0.7,
+    "no_repeat_ngram_size": 4,
     "repetition_penalty": 1.5,
-    "no_repeat_ngram_size": 3,
+    "eos_token_id": tokenizer.eos_token_id,
+    "num_beams": 1,
+    "bad_words_ids": [[tokenizer.convert_tokens_to_ids("—")]],
+    "stopping_criteria": StoppingCriteriaList([ImprovedStopCriteria(tokenizer)])
 }
 
 # Функция для очистки ответа
@@ -25,18 +57,18 @@ def clean_response(text):
 
 # Диалоговый цикл
 def run_chat():
-    print("Привет! Давай поговорим. Напиши 'стоп' чтобы выйти.\n")
+    print("Exi(s)t: Привет! Давай поговорим. Напиши 'стоп' чтобы выйти.\n")
     history = []
     
     while True:
         user_input = input("Ты: ")
         if user_input.lower() in ["стоп", "stop", "выход"]:
-            print("Бот: Пока!")
+            print("Exi(s)t: Счастливо!")
             break
             
         # Формируем промпт с историей
         history.append(f"Пользователь: {user_input}")
-        prompt = "\n".join(history[-4:]) + "\nБот:"  # Берем последние 4 реплики
+        prompt = "\n".join(history[-4:]) + "\nExi(s)t:"  # Берем последние 4 реплики
         
         # Генерация ответа
         inputs = tokenizer(prompt, return_tensors="pt")
@@ -47,8 +79,8 @@ def run_chat():
         bot_response = bot_response[len(prompt):]
         bot_response = clean_response(bot_response)
         
-        print(f"Бот: {bot_response}")
-        history.append(f"Бот: {bot_response}")
+        print(f"Exi(s)t: {bot_response}")
+        history.append(f"Exi(s)t: {bot_response}")
 
 # Запуск чата
 run_chat()
