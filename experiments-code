@@ -1,95 +1,178 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer
-import re
 import random
+import re
+import numpy as np
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from bert_score import BERTScorer
+from pymorphy3 import MorphAnalyzer
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+class ExistentialTherapist:
+    def __init__(self):
+        # Загрузка легкой модели генерации (оптимизирована для CPU)
+        self.generator = pipeline(
+            "text-generation",
+            model="sberbank-ai/rugpt3small_based_on_gpt2",
+            tokenizer="sberbank-ai/rugpt3small_based_on_gpt2",
+            device=torch.device("cpu") if not torch.cuda.is_available() else 0
+        )
+        
+        # Морфологический анализатор
+        self.morph = MorphAnalyzer()
+        
+        # Инициализация BERTScore
+        self.scorer = BERTScorer(lang="ru", rescale_with_baseline=False)
+        
+        # Словарь данностей и ассоциаций
+        self.existentials = {
+            "одиночество": {"keywords": {"свобода": 0.5, "тишина": 0.7, "грусть": 0.6, "пустота": 0.8, 
+                                         "тоска": 0.7, "покой": 0.5, "спокойствие": 0.4, "холод": 0.5, "печаль": 0.6}},
+            "смерть": {"keywords": {"конец": 0.8, "покой": 0.7, "пустота": 0.6, "страх": 0.7, 
+                                    "освобождение": 0.5, "неизвестность": 0.6, "перерождение": 0.4, "свобода": 0.3, "траур": 0.3}},
+            "свобода": {"keywords": {"выбор": 0.8, "воздух": 0.7, "пространство": 0.8, "простор": 0.7, 
+                                     "счастье": 0.6, "жизнь": 0.5, "ветер": 0.6, "небо": 0.5, "воля": 0.9, "полёт": 0.5}},
+            "бессмысленность": {"keywords": {"пустота": 0.8, "абсурд": 0.9, "депрессия": 0.6, "апатия": 0.6, 
+                                             "тоска": 0.5, "грусть": 0.4, "скука": 0.4, "безысходность": 0.7, "тщетность": 0.7, "серость": 0.5}}
+        }
+        
+        # Терапевтические техники
+        self.techniques = {
+            "одиночество": [
+                "Техника 'Диалог с одиночеством': Предлагаю вам представить ваше одиночество как собеседника. Что бы оно вам сказало? Как бы вы ответили?",
+                "Техника 'Переосмысление пустоты': Иногда пустота - это не отсутствие, а пространство для нового. Что могло бы заполнить эту пустоту?",
+                "Техника 'Тишина как ресурс': Давайте исследуем, какие возможности дает вам эта тишина и уединение?"
+            ],
+            "смерть": [
+                "Техника 'Разговор с конечностью': Если бы сегодня был ваш последний день, что бы вы сделали иначе? Что это говорит о ваших ценностях?",
+                "Техника 'Наследие': Представьте, что оставшееся время - это подарок. Что вы хотите успеть создать или передать?",
+                "Техника 'Диалог со страхом': Давайте представим ваш страх смерти как отдельное существо. О чем он пытается вас предупредить?"
+            ],
+            "свобода": [
+                "Техника 'Границы свободы': Где проходит граница между свободой и ответственностью в вашей ситуации?",
+                "Техника 'Выбор как отражение ценностей': Как этот выбор отражает то, что действительно важно для вас?",
+                "Техника 'Полет без парашюта': Что бы вы делали, если бы гарантированно не потерпели неудачу?"
+            ],
+            "бессмысленность": [
+                "Техника 'Создание смысла': Давайте представим, что смысл - это не то, что мы находим, а то, что создаем. Что могло бы сделать вашу ситуацию осмысленной?",
+                "Техника 'Абсурд как освобождение': Если жизнь абсурдна, то какие правила вы можете переписать для себя?",
+                "Техника 'Маленькие смыслы': Какие маленькие, но значимые для вас вещи могут противостоять этой пустоте?"
+            ]
+        }
+        
+        # Создание индекса лемм
+        self.lemma_index = self.build_lemma_index()
 
-try:
-    model_path = "/kaggle/working/results"
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model = AutoModelForCausalLM.from_pretrained(model_path).to(device)
-    print("Модель успешно подгрузилась")
-except Exception as e:
-    print(f"Ошибка загрузки: {e}")
-    exit()
+    def build_lemma_index(self):
+        index = {}
+        for category, data in self.existentials.items():
+            for keyword, weight in data["keywords"].items():
+                lemma = self.morph.parse(keyword)[0].normal_form
+                if lemma not in index:
+                    index[lemma] = []
+                index[lemma].append((category, weight))
+        return index
 
-# Библиотека терапевтических техник
-TECHNIQUES = {
-    "одиночество": [
-        "Как вы обычно заполняете пустоту? Возможно, творчество или отношения?",
-        "Опишите своё одиночество как объект: какой у него цвет и форма?",
-        "Если бы ваше одиночество могло говорить, что бы оно сказало?"
-    ],
-    "смерть": [
-        "Попробуйте представить свой страх до абсурда — что в нём самого нелепого?",
-        "Что бы вы хотели оставить после себя?",
-        "Представьте смерть как собеседника — о чём бы вы её спросили?"
-    ],
-    "свобода": [
-        "Шкалирование: 'Насколько свобода для вас сейчас — бремя или дар?' (1-10)",
-        "Контраст: 'Опишите момент полной свободы и момента её отсутствия'",
-        "Метафора: 'Если бы ваша свобода была природным явлением, каким бы она была?'"
-    ],
-    "бессмысленность": [
-        "Деконструкция: 'Что для вас 'смысл'? Как вы понимаете его отсутствие?'",
-        "Эксперимент: 'Представьте, что смысл внезапно появился — что изменилось бы?'",
-        "Дневник смыслов: предложите отмечать даже маленькие осмысленные моменты"
-    ]
-}
+    def detect_existential(self, message):
+        words = re.findall(r'\b\w+\b', message.lower())
+        category_weights = {cat: 0.0 for cat in self.existentials}
+        
+        for word in words:
+            lemma = self.morph.parse(word)[0].normal_form
+            if lemma in self.lemma_index:
+                # Выбираем данность с максимальным весом для леммы
+                best_category, best_weight = max(self.lemma_index[lemma], key=lambda x: x[1])
+                category_weights[best_category] += best_weight
+        
+        if not any(category_weights.values()):
+            return None
+        
+        return max(category_weights, key=category_weights.get)
 
-def generate_natural_response(user_input):
-    prompt = f"""
-Ты — экзистенциальный психотерапевт. Ответь клиенту естественно, используя подходящие техники.
+    def generate_response(self, technique):
+        # Генерация с помощью промпт-инжиниринга
+        prompt = f"Терапевт использует технику: '{technique}'. Продолжи ответ терапевта клиенту:"
+        
+        try:
+            response = self.generator(
+                prompt,
+                max_length=150,
+                num_return_sequences=1,
+                temperature=0.7,
+                top_p=0.9,
+                no_repeat_ngram_size=2,
+                pad_token_id=self.generator.tokenizer.eos_token_id,
+                eos_token_id=self.generator.tokenizer.eos_token_id,
+                do_sample=True
+            )[0]['generated_text']
+            
+            # Извлекаем только сгенерированный текст (без промпта)
+            response = response.replace(prompt, "").strip()
+            return self.clean_response(response)
+        except Exception as e:
+            print(f"Ошибка генерации: {e}")
+            return None
 
-**Правила ответа:**
+    def clean_response(self, response):
+        # Удаление диалоговых меток и спецсимволов
+        response = re.sub(r'^(Клиент:|Терапевт:|\-|\*)', '', response).strip()
+        
+        # Обрезка до последнего завершенного предложения
+        sentences = re.split(r'(?<=[.!?])\s+', response)
+        if sentences:
+            return sentences[0]
+        return response
 
-1. Определи категории (используй ассоциации из списка):
-   - Свобода: свобода, выбор, воздух, пространство, простор, счастье, жизнь, ветер, небо, воля, полёт.
-   - Бессмысленность: бессмысленность, пустота, абсурд, депрессия, апатия, тоска, грусть, скука, безысходность, тщетность, серость.
-   - Одиночество: одиночество, свобода, тишина, грусть, пустота, тоска, покой, спокойствие, холод, печаль, одиночество.
-   - Смерть: конец, смерть, покой, пустота, страх, освобождение, неизвестность, перерождение, свобода, траур.
-2. Выбери технику работы (из базы):
-   {TECHNIQUES}
-3. Выведи категории, которые ты определил, в формате: категория — слово пользователя.
+    def calculate_bertscore(self, gen_text, ref_text):
+        # Расчет BERTScore (F1)
+        P, R, F1 = self.scorer.score([gen_text], [ref_text])
+        return F1.item()
 
-Запрос: "{user_input}"
-Ответ (без технических пометок, только естественная речь):
-"""
+    def respond(self, message):
+        # Определение экзистенциальной данности
+        category = self.detect_existential(message)
+        if not category:
+            fallback = "Я понимаю ваши переживания. Давайте попробуем разобраться в этом вместе."
+            return fallback, 0.0
+        
+        # Выбор случайной техники
+        technique = random.choice(self.techniques[category])
+        
+        # Генерация ответа
+        response = self.generate_response(technique)
+        
+        # Fallback на чистую технику при неудаче
+        if not response or len(response) < 10 or not re.search(r'[.!?]$', response):
+            # Берем только текст техники (без названия)
+            parts = technique.split(':', 1)
+            if len(parts) > 1:
+                response = parts[1].strip()
+            else:
+                response = technique
+        
+        # Оценка соответствия
+        score = self.calculate_bertscore(response, technique)
+        return response, round(score, 2)
 
-    generation_config = {
-        "max_new_tokens": 200,  # Уменьшил лимит токенов
-        "do_sample": True,
-        "temperature": 0.7,  # Более консервативный параметр
-        "top_k": 40,
-        "top_p": 0.9,
-        "no_repeat_ngram_size": 3,
-        "repetition_penalty": 1.1,
-        "eos_token_id": tokenizer.eos_token_id,
-        "pad_token_id": tokenizer.eos_token_id,
-}
-    
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
-    output = model.generate(**inputs, **generation_config)
-    response = tokenizer.decode(output[0], skip_special_tokens=True)
-    
-    # Постобработка
-    response = response[len(prompt):].strip()
-    response = re.sub(r'^(—|"|\').*?[.!?]\s*', '', response)  # Удаляем диалоговые маркеры
-    
-    # Если ответ слишком короткий, добавляем технику вручную
-    if len(response.split()) < 5:
-        if "одиночеств" in user_input.lower():
-            response = random.choice(TECHNIQUES["одиночество"])
-        elif "смерт" in user_input.lower():
-            response = random.choice(TECHNIQUES["смерть"])
-        elif "смысл" in user_input.lower():
-            response = random.choice(TECHNIQUES["бессмысленность"])
-         elif "свобод" in user_input.lower():
-            response = random.choice(TECHNIQUES["свобода"])   
-    
-    return response if response else "Расскажите об этом подробнее..."
+# Инициализация терапевта
+therapist = ExistentialTherapist()
 
-# Пример использования
-user_input = "Я чувствую ледяную пустоту внутри"
-response = 'Exi(s)t:' + generate_natural_response(user_input)
-print(response)
+# Тестовый диалог
+test_messages = [
+    "На улице лето, хочется чувствовать простор и счастье, но нужно готовиться к сессии.",
+    "Зачем нужно свободное время, если некуда его тратить?",
+    "Как хочется просто ощущать ветер в волосах и ни о чем не думать.",
+    "Мне кажется, что очень многое из того, что нужно делать каждый день, абсолютно бессмысленно.",
+    "Каждый день одно и то же, серость и скука.",
+    "Как же тщетны мои усилия, я беспомощна.",
+    "Я больше не могу находиться в этой гнетущей тишине.",
+    "Мне так одиноко, не с кем даже поговорить.",
+    "Почему ото всех я чувствую только холод? ",
+    "Я врач, но так сложно не понимать, что будет в конце.",
+    "Может вечный покой - это все же решение моих проблем?",
+    "Страшно осознавать, что в итоге нам останется лишь пустота."
+]
+
+for msg in test_messages:
+    print(f"Клиент: {msg}")
+    response, score = therapist.respond(msg)
+    print(f"Exi(s)t: {response}")
+    print(f"BERTScore: {score}\n")
