@@ -15,13 +15,15 @@ from peft import LoraConfig, get_peft_model
 from datasets import Dataset
 import re
 import numpy as np
+from rouge_score import rouge_scorer
+from transformers import EarlyStoppingCallback
 
 # Очистка памяти
 def clear_memory():
     torch.cuda.empty_cache()
     gc.collect()
 
-# 1. Конфигурация
+# Конфигурация
 MODEL_NAME = "Defetya/qwen-1.8B-saiga"
 INPUT_DIR = "/kaggle/input/exist-train/"
 OUTPUT_DIR = "/kaggle/working/"
@@ -30,14 +32,6 @@ MAX_SAMPLES = 16384
 BATCH_SIZE = 1
 GRAD_ACCUM_STEPS = 8
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-EVAL_METRICS = {
-    "bertscore": {
-        "model_type": "microsoft/deberta-xlarge-mnli",
-        "batch_size": 8,
-        "device": DEVICE,
-        "lang": "ru" if "ru" in MODEL_NAME else "en"
-    }
-}
 
 def epub_to_text(path):
     try:
@@ -54,13 +48,11 @@ def epub_to_text(path):
 
         with zipfile.ZipFile(path) as z:
             if 'mimetype' not in z.namelist() or z.read('mimetype').decode() != 'application/epub+zip':
-                print(f"  {os.path.basename(path)} не является валидным EPUB-файлом")
                 return ""
 
             container = ET.fromstring(z.read('META-INF/container.xml'))
             rootfile = container.find('.//n:rootfile', ns)
             if rootfile is None:
-                print(f"  Не найден rootfile в {os.path.basename(path)}")
                 return ""
 
             opf_path = rootfile.attrib['full-path']
@@ -68,18 +60,15 @@ def epub_to_text(path):
             opf = ET.fromstring(z.read(opf_path))
             spine = opf.find('opf:spine', ns)
             if spine is None:
-                print(f"  Не найден spine в {os.path.basename(path)}")
                 return ""
 
             itemrefs = spine.findall('opf:itemref', ns)
             if not itemrefs:
-                print(f"  Не найдены itemref в spine {os.path.basename(path)}")
                 return ""
 
             start_index = 2 if len(itemrefs) > 2 else 0
             manifest = opf.find('opf:manifest', ns)
             if manifest is None:
-                print(f"  Не найден manifest в {os.path.basename(path)}")
                 return ""
 
             id_to_file = {}
@@ -106,12 +95,11 @@ def epub_to_text(path):
 
                     if text and len(text) > 50:
                         full_text.append(text)
-                except Exception as e:
-                    print(f"  Ошибка обработки {html_file}: {str(e)}")
+                except Exception:
+                    continue
 
         return " ".join(full_text)
-    except Exception as e:
-        print(f"Ошибка чтения {os.path.basename(path)}: {str(e)}")
+    except Exception:
         return ""
 
 def load_dataset():
@@ -130,14 +118,9 @@ def load_dataset():
             f"Доступные файлы:\n{available_files}"
         )
 
-    print(f"\nНайдено {len(supported_files)} EPUB файлов для обработки")
-
     for filepath in supported_files:
-        print(f"\nОбработка: {os.path.basename(filepath)}")
         text = epub_to_text(filepath)
-        
         if not text:
-            print(f"  Пропущен (пустой текст)")
             continue
 
         for i in range(0, len(text), CHUNK_SIZE):
@@ -148,14 +131,9 @@ def load_dataset():
             if len(chunks) >= MAX_SAMPLES:
                 break
 
-        print(f"  Добавлено фрагментов: {min(len(text)//CHUNK_SIZE, MAX_SAMPLES - len(chunks))}")
-        print(f"  Всего фрагментов: {len(chunks)}")
-
         if len(chunks) >= MAX_SAMPLES:
-            print(f"\nДостигнут максимум в {MAX_SAMPLES} фрагментов")
             break
 
-    print(f"\nИтого создано {len(chunks)} текстовых фрагментов")
     return Dataset.from_list(chunks[:MAX_SAMPLES])
 
 print("\n=== Загрузка данных ===")
@@ -167,14 +145,13 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 tokenizer.pad_token = tokenizer.eos_token
 
 def tokenize_function(examples):
-    tokenized = tokenizer(
+    # Токенизируем текст без добавления labels
+    return tokenizer(
         examples["text"],
         padding="max_length",
         truncation=True,
         max_length=CHUNK_SIZE,
     )
-    tokenized["labels"] = tokenized["input_ids"].copy()
-    return tokenized
 
 tokenized_dataset = dataset.map(
     tokenize_function,
@@ -209,12 +186,6 @@ clear_memory()
 
 print("\n=== Настройка обучения ===")
 
-from transformers import TrainingArguments, Trainer, EarlyStoppingCallback
-from rouge_score import rouge_scorer
-from nltk.translate.bleu_score import corpus_bleu
-from collections import Counter
-import math
-
 class RougeMetrics:
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
@@ -230,105 +201,53 @@ class RougeMetrics:
             'rougeL': np.mean([s['rougeL'].fmeasure for s in scores])
         }
 
-class NGramMetrics:
-    def __init__(self, tokenizer):
-        self.tokenizer = tokenizer
-    
-    def compute(self, preds, refs):
-        refs = [[ref.split()] for ref in refs]
-        preds = [pred.split() for pred in preds]
-        bleu = corpus_bleu(refs, preds)
-        
-        word_counts = Counter()
-        for pred in preds:
-            word_counts.update(pred)
-        perplexity = math.exp(-sum(math.log(word_counts[word]/sum(word_counts.values())) 
-                            for word in word_counts)/len(word_counts))
-        
-        return {'bleu': bleu, 'perplexity': perplexity}
-
 class ExistentialTrainer(Trainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.tokenizer = tokenizer
         self.rouge = RougeMetrics(tokenizer)
-        self.ngram = NGramMetrics(tokenizer)
-        self.last_metrics = {}
         self.metrics_file = os.path.join(self.args.output_dir, "training_metrics.json")
-        self._load_metrics()
         
     def compute_metrics(self, eval_preds):
-        try:
-            preds, labels = eval_preds
-            
-            # Заменяем -100 (игнорируемые токены) на pad_token_id
-            labels = np.where(labels != -100, labels, self.tokenizer.pad_token_id)
-            
-            # Декодируем с учетом особых случаев
-            decoded_preds = self.tokenizer.batch_decode(
-                preds, 
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=True
-            )
-            decoded_labels = self.tokenizer.batch_decode(
-                labels,
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=True
-            )
-            
-            # Фильтруем пустые строки
-            decoded_preds = [p.strip() for p in decoded_preds if p.strip()]
-            decoded_labels = [l.strip() for l in decoded_labels if l.strip()]
-            
-            if not decoded_preds or not decoded_labels:
-                return {"rouge1": 0.0, "rougeL": 0.0, "bleu": 0.0}
-            
-            # Вычисляем метрики
-            metrics = {
-                **self.rouge.compute(decoded_preds, decoded_labels),
-                **self.ngram.compute(decoded_preds, decoded_labels)
-            }
-            
-            # Добавляем примеры для отладки (первые 3 образца)
-            metrics['samples'] = list(zip(decoded_labels[:3], decoded_preds[:3]))
-            
-            return metrics
-            
-        except Exception as e:
-            print(f"Ошибка при вычислении метрик: {str(e)}")
-            return {"rouge1": 0.0, "rougeL": 0.0, "bleu": 0.0, "error": str(e)}
-    
-    def _load_metrics(self):
-        if os.path.exists(self.metrics_file):
-            try:
-                with open(self.metrics_file, "r") as f:
-                    self.last_metrics = json.load(f)
-                print(f"Загружены сохраненные метрики из {self.metrics_file}")
-            except Exception as e:
-                print(f"Ошибка загрузки метрик: {str(e)}")
-
-    def _save_metrics(self, metrics: Dict[str, Any]):
-        try:
-            with open(self.metrics_file, "w") as f:
-                json.dump(metrics, f, indent=2)
-            self.last_metrics = metrics
-        except Exception as e:
-            print(f"Ошибка сохранения метрик: {str(e)}")
-
-    def safe_evaluate(self):
-        try:
-            metrics = self.evaluate()
-            self._save_metrics(metrics)
-            return metrics
-        except Exception as e:
-            print(f"\n⚠️ Ошибка при вычислении метрик: {str(e)}")
-            print(f"Используем последние сохраненные метрики")
-            return self.last_metrics or {"error": "No metrics available"}
+        preds, labels = eval_preds
+        
+        # Декодируем предсказания и метки
+        decoded_preds = self.tokenizer.batch_decode(preds, skip_special_tokens=True)
+        decoded_labels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
+        
+        # Фильтрация пустых строк
+        decoded_preds = [p.strip() for p in decoded_preds if p.strip()]
+        decoded_labels = [l.strip() for l in decoded_labels if l.strip()]
+        
+        # Вычисляем ROUGE
+        rouge_scores = {
+            'rouge1': [],
+            'rouge2': [],
+            'rougeL': []
+        }
+        
+        for pred, label in zip(decoded_preds, decoded_labels):
+            scores = self.rouge_scorer.score(label, pred)
+            rouge_scores['rouge1'].append(scores['rouge1'].fmeasure)
+            rouge_scores['rouge2'].append(scores['rouge2'].fmeasure)
+            rouge_scores['rougeL'].append(scores['rougeL'].fmeasure)
+        
+        # Вычисляем BLEU
+        refs = [[ref.split()] for ref in decoded_labels]
+        preds = [pred.split() for pred in decoded_preds]
+        bleu_score = corpus_bleu(refs, preds, smoothing_function=self.smoothing)
+        
+        return {
+            'rouge1': np.mean(rouge_scores['rouge1']),
+            'rouge2': np.mean(rouge_scores['rouge2']),
+            'rougeL': np.mean(rouge_scores['rougeL']),
+            'bleu': bleu_score,
+            'samples': list(zip(decoded_labels[:3], decoded_preds[:3]))
+        }
 
 data_collator = DataCollatorForLanguageModeling(
     tokenizer=tokenizer,
     mlm=False,
-    pad_to_multiple_of=8
 )
 
 train_size = int(0.9 * len(tokenized_dataset))
@@ -341,77 +260,59 @@ training_args = TrainingArguments(
     per_device_train_batch_size=BATCH_SIZE,
     gradient_accumulation_steps=GRAD_ACCUM_STEPS,
     per_device_eval_batch_size=1,
-    eval_accumulation_steps=1,
     optim="adamw_torch",
     fp16=True,
-    fp16_full_eval=True,
-    logging_steps=20,
-    save_steps=500,
     learning_rate=5e-5,
     max_grad_norm=0.3,
     eval_strategy="steps",
-    eval_steps=100,
-    bf16=False,
-    tf32=False,
-    num_train_epochs=2,
+    eval_steps=250,
+    logging_steps=10,
+    save_strategy="steps",
+    save_steps=50,
     weight_decay=0.01,
     gradient_checkpointing=True,
     save_total_limit=2,
-    report_to="none",
-    max_steps=2000,
+    max_steps=5000,
     load_best_model_at_end=True,
     metric_for_best_model="eval_loss",
     greater_is_better=False,
-    ddp_find_unused_parameters=False,
-    remove_unused_columns=True,
-    label_names=["labels"],
-    dataloader_pin_memory=True,
-    dataloader_num_workers=1,
-    no_cuda=not torch.cuda.is_available(),
-    use_cpu=not torch.cuda.is_available(),
-    local_rank=-1
+    report_to="none",
 )
-
-def print_metrics(metrics):
-    print("\n=== Final Metrics ===")
-    print(f"Training Loss: {metrics.get('train_loss', 0.0):.4f}")
-    print(f"Validation Loss: {metrics.get('eval_loss', 0.0):.4f}")
-    print("\nGeneration Quality:")
-    print(f"ROUGE-1: {metrics.get('rouge1', 0):.3f}")
-    print(f"ROUGE-L: {metrics.get('rougeL', 0):.3f}")
-    print(f"BLEU: {metrics.get('bleu', 0):.3f}")
-    
-    if 'samples' in metrics:
-        print("\nGeneration Samples:")
-        for i, (ref, pred) in enumerate(metrics['samples']):
-            print(f"\nSample {i+1}:")
-            print(f"Reference: {ref[:200]}{'...' if len(ref) > 200 else ''}")
-            print(f"Generated: {pred[:200]}{'...' if len(pred) > 200 else ''}")
 
 trainer = ExistentialTrainer(
     model=model,
-    tokenizer=tokenizer,
+    processing_class=tokenizer,
     args=training_args,
     train_dataset=train_dataset,
     eval_dataset=eval_dataset,
     data_collator=data_collator,
-    callbacks=[EarlyStoppingCallback(early_stopping_patience=3, early_stopping_threshold=0.1)]
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=3)]
 )
 
 try:
     print("Начало обучения...")
     trainer.train()
-    final_metrics = trainer.safe_evaluate()
-    print_metrics(final_metrics)
+    
+    # Сохранение модели
+    trainer.save_model(os.path.join(OUTPUT_DIR, "final_model"))
+    tokenizer.save_pretrained(os.path.join(OUTPUT_DIR, "final_model"))
+    
+    # Оценка
+    eval_results = trainer.evaluate()
+    print("\nРезультаты оценки:")
+    print(f"Loss: {eval_results['eval_loss']:.4f}")
+    print(f"ROUGE-1: {eval_results.get('rouge1', 0):.4f}")
+    print(f"ROUGE-L: {eval_results.get('rougeL', 0):.4f}")
+    
+    # Пример генерации
+    print("\nПример генерации:")
+    input_text = "Что такое свобода?"
+    inputs = tokenizer(input_text, return_tensors="pt").to(DEVICE)
+    outputs = model.generate(**inputs, max_new_tokens=50)
+    print(tokenizer.decode(outputs[0], skip_special_tokens=True))
+    
 except Exception as e:
-    print(f"\n⚠️ Произошла ошибка: {str(e)}")
-    print("Попытка восстановить последние метрики...")
-    final_metrics = trainer.last_metrics or {"error": "No metrics available"}
-    print_metrics(final_metrics)
+    print(f"\nОшибка при обучении: {str(e)}")
 finally:
-    trainer.save_model(os.path.join(OUTPUT_DIR, "results"))
-    print("\nМодель сохранена в безопасном режиме")
-
-print("\n=== Обучение завершено ===")
-print("Сохраненные файлы:", os.listdir(os.path.join(OUTPUT_DIR, "results")))
-clear_memory()
+    clear_memory()
+    print("\nОбучение завершено")
