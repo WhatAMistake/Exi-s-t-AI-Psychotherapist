@@ -1,79 +1,84 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
+from transformers import AutoModelForCausalLM, AutoTokenizer
 import re
+import random
 
-model_path = "./rugpt3small-trained"
-model = AutoModelForCausalLM.from_pretrained(model_path)
-tokenizer = AutoTokenizer.from_pretrained(model_path)
-
-class ImprovedStopCriteria(StoppingCriteria):
-    def __init__(self, tokenizer, min_length=20, max_length=100, stop_sequences=["\n\n", "###"]):
-        self.tokenizer = tokenizer
-        self.min_length = min_length  # Минимум слов/токенов для генерации
-        self.max_length = max_length
-        self.stop_sequences = stop_sequences
-        
-    def __call__(self, input_ids, scores, **kwargs):
-        current_text = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
-        
-        # 1. Не останавливаемся раньше min_length
-        if input_ids.shape[1] < self.min_length:
-            return False
-            
-        # 2. Проверка стоп-последовательностей (только в конце текста)
-        if any(current_text.rstrip().endswith(seq) for seq in self.stop_sequences):
-            return True
-            
-        # 3. Останавливаемся на естественных границах (но только после разумной длины)
-        last_char = current_text.rstrip()[-1] if current_text.rstrip() else ''
-        if input_ids.shape[1] > self.min_length and last_char in {'.', '?', '!'}:
-            return True
-            
-        # 4. Fallback: максимальная длина
-        if input_ids.shape[1] >= self.max_length:
-            return True
-            
-        return False
-
-generation_config = {
-    "max_new_tokens": 150, 
-    "do_sample": True,
-    "temperature": 1,
-    "top_k": 50,
-    "top_p": 0.9,
-    "no_repeat_ngram_size": 4,
-    "repetition_penalty": 1.5,
-    "eos_token_id": tokenizer.eos_token_id,
-    "num_beams": 1,
-    "stopping_criteria": StoppingCriteriaList([ImprovedStopCriteria(tokenizer)])
+# Библиотека терапевтических техник
+TECHNIQUES = {
+    "одиночество": [
+        "Как вы обычно заполняете пустоту? Возможно, творчество или отношения?",
+        "Опишите своё одиночество как объект: какой у него цвет и форма?",
+        "Если бы ваше одиночество могло говорить, что бы оно сказало?"
+    ],
+    "смерть": [
+        "Попробуйте представить свой страх до абсурда — что в нём самого нелепого?",
+        "Что бы вы хотели оставить после себя?",
+        "Представьте смерть как собеседника — о чём бы вы её спросили?"
+    ],
+    "свобода": [
+        "Шкалирование: 'Насколько свобода для вас сейчас — бремя или дар?' (1-10)",
+        "Контраст: 'Опишите момент полной свободы и момента её отсутствия'",
+        "Метафора: 'Если бы ваша свобода была природным явлением, каким бы она была?'"
+    ],
+    "бессмысленность": [
+        "Деконструкция: 'Что для вас 'смысл'? Как вы понимаете его отсутствие?'",
+        "Эксперимент: 'Представьте, что смысл внезапно появился — что изменилось бы?'",
+        "Дневник смыслов: предложите отмечать даже маленькие осмысленные моменты"
+    ]
 }
 
-def generate_response(input_text):
-    inputs = tokenizer(input_text, return_tensors="pt")
-    output = model.generate(
-        **inputs,
-        **generation_config
-    )
+def generate_natural_response(user_input):
+    prompt = f"""
+Ты — экзистенциальный психотерапевт. Ответь клиенту естественно, используя подходящие техники.
+
+**Правила ответа:**
+
+1. Определи категории (используй ассоциации из списка):
+   - Свобода: свобода, выбор, воздух, пространство, простор, счастье, жизнь, ветер, небо, воля, полёт.
+   - Бессмысленность: бессмысленность, пустота, абсурд, депрессия, апатия, тоска, грусть, скука, безысходность, тщетность, серость.
+   - Одиночество: одиночество, свобода, тишина, грусть, пустота, тоска, покой, спокойствие, холод, печаль, одиночество.
+   - Смерть: конец, смерть, покой, пустота, страх, освобождение, неизвестность, перерождение, свобода, траур.
+2. Выбери технику работы (из базы):
+   {TECHNIQUES}
+3. Выведи категории, которые ты определил, в формате: категория — слово пользователя.
+
+Запрос: "{user_input}"
+Ответ (без технических пометок, только естественная речь):
+"""
+
+    generation_config = {
+        "max_new_tokens": 200,  # Уменьшил лимит токенов
+        "do_sample": True,
+        "temperature": 0.7,  # Более консервативный параметр
+        "top_k": 40,
+        "top_p": 0.9,
+        "no_repeat_ngram_size": 3,
+        "repetition_penalty": 1.1,
+        "eos_token_id": tokenizer.eos_token_id,
+        "pad_token_id": tokenizer.eos_token_id,
+}
     
-    # Декодируем ВЕСЬ текст (включая input)
-    full_text = tokenizer.decode(output[0], skip_special_tokens=True)
-    
-    # Удаляем входной текст, но не обрезая начало ответа
-    if full_text.startswith(input_text):
-        # Оставляем входной текст + 1 символ (чтобы не оборвать слово)
-        response = full_text[len(input_text):].lstrip(" ,.:;")  # Убираем лишние знаки после промпта
-    else:
-        response = full_text  # На случай, если модель не повторила input
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    output = model.generate(**inputs, **generation_config)
+    response = tokenizer.decode(output[0], skip_special_tokens=True)
     
     # Постобработка
-    response = re.sub(r'\s+([.,!?])', r'\1', response)  # Убираем пробелы перед пунктуацией
-    response = response.strip()
+    response = response[len(prompt):].strip()
+    response = re.sub(r'^(—|"|\').*?[.!?]\s*', '', response)  # Удаляем диалоговые маркеры
     
-    # Если ответ начинается с маленькой буквы — исправляем
-    if len(response) > 1 and response[0].islower():
-        response = response[0].upper() + response[1:]
+    # Если ответ слишком короткий, добавляем технику вручную
+    if len(response.split()) < 5:
+        if "одиночеств" in user_input.lower():
+            response = random.choice(TECHNIQUES["одиночество"])
+        elif "смерт" in user_input.lower():
+            response = random.choice(TECHNIQUES["смерть"])
+        elif "смысл" in user_input.lower():
+            response = random.choice(TECHNIQUES["бессмысленность"])
+         elif "свобод" in user_input.lower():
+            response = random.choice(TECHNIQUES["свобода"])   
     
-    return response if response else "Не удалось сгенерировать осмысленный ответ."
+    return response if response else "Расскажите об этом подробнее..."
 
-input_text = "В чём смысл жизни?"
-response = generate_response(input_text)
+# Пример использования
+user_input = "Я чувствую ледяную пустоту внутри"
+response = generate_natural_response(user_input)
 print(response)
