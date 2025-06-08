@@ -1,171 +1,203 @@
 import os
 import torch
-from datasets import Dataset
+import json
+import zipfile
+import gc
+from typing import Dict, Any
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
     TrainingArguments,
     Trainer,
-    BitsAndBytesConfig
+    DataCollatorForLanguageModeling
 )
 from peft import LoraConfig, get_peft_model
-from bs4 import BeautifulSoup
+from datasets import Dataset
 import re
-import signal
-import sys
+import numpy as np
+
+# Очистка памяти
+def clear_memory():
+    torch.cuda.empty_cache()
+    gc.collect()
 
 # 1. Конфигурация
-EPUB_DIR = os.path.expanduser("~/exist_train")  # Папка с книгами
-CHUNK_SIZE = 512
+MODEL_NAME = "Defetya/qwen-1.8B-saiga"
+INPUT_DIR = "/kaggle/input/exist-train/"
+OUTPUT_DIR = "/kaggle/working/"
+CHUNK_SIZE = 256
 MAX_SAMPLES = 16384
-MODEL_NAME = "ai-forever/rugpt3small_based_on_gpt2"  
+BATCH_SIZE = 1
+GRAD_ACCUM_STEPS = 8
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+EVAL_METRICS = {
+    "bertscore": {
+        "model_type": "microsoft/deberta-xlarge-mnli",
+        "batch_size": 8,
+        "device": DEVICE,
+        "lang": "ru" if "ru" in MODEL_NAME else "en"
+    }
+}
 
-print(f"EPUB-файлы должны быть размещены в: {EPUB_DIR}")
-
-# 2. Функция для конвертации EPUB в текст
 def epub_to_text(path):
     try:
-        import zipfile
         import xml.etree.ElementTree as ET
         from bs4 import BeautifulSoup
-        import re
-        import os
-        
+
         ns = {
             'n': 'urn:oasis:names:tc:opendocument:xmlns:container',
-            'opf': 'http://www.idpf.org/2007/opf'
+            'opf': 'http://www.idpf.org/2007/opf',
+            'dc': 'http://purl.org/dc/elements/1.1/'
         }
-        
+
         full_text = []
-        
+
         with zipfile.ZipFile(path) as z:
             if 'mimetype' not in z.namelist() or z.read('mimetype').decode() != 'application/epub+zip':
                 print(f"  {os.path.basename(path)} не является валидным EPUB-файлом")
                 return ""
-                
+
             container = ET.fromstring(z.read('META-INF/container.xml'))
             rootfile = container.find('.//n:rootfile', ns)
             if rootfile is None:
                 print(f"  Не найден rootfile в {os.path.basename(path)}")
                 return ""
-                
+
             opf_path = rootfile.attrib['full-path']
             opf_dir = os.path.dirname(opf_path)
-            
             opf = ET.fromstring(z.read(opf_path))
+            spine = opf.find('opf:spine', ns)
+            if spine is None:
+                print(f"  Не найден spine в {os.path.basename(path)}")
+                return ""
+
+            itemrefs = spine.findall('opf:itemref', ns)
+            if not itemrefs:
+                print(f"  Не найдены itemref в spine {os.path.basename(path)}")
+                return ""
+
+            start_index = 2 if len(itemrefs) > 2 else 0
             manifest = opf.find('opf:manifest', ns)
             if manifest is None:
                 print(f"  Не найден manifest в {os.path.basename(path)}")
                 return ""
-                
-            html_files = []
+
+            id_to_file = {}
             for item in manifest.findall('opf:item', ns):
-                if item.attrib['media-type'] in ['application/xhtml+xml', 'text/html']:
-                    html_files.append(os.path.join(opf_dir, item.attrib['href']))
-            
-            for html_file in html_files:
+                id_to_file[item.attrib['id']] = os.path.join(opf_dir, item.attrib['href'])
+
+            for itemref in itemrefs[start_index:]:
+                item_id = itemref.attrib['idref']
+                if item_id not in id_to_file:
+                    continue
+
+                html_file = id_to_file[item_id]
                 try:
                     content = z.read(html_file)
                     soup = BeautifulSoup(content, 'html.parser')
+
+                    for element in soup(['header', 'nav', 'toc', 'table-of-contents', 'script', 'style']):
+                        element.decompose()
+
                     text = soup.get_text()
-                    
                     text = re.sub(r'\s+', ' ', text)
                     text = re.sub(r'[^\w\s.,!?;:—–-]', '', text)
                     text = text.strip()
-                    
-                    if text:
+
+                    if text and len(text) > 50:
                         full_text.append(text)
                 except Exception as e:
                     print(f"  Ошибка обработки {html_file}: {str(e)}")
-        
+
         return " ".join(full_text)
     except Exception as e:
         print(f"Ошибка чтения {os.path.basename(path)}: {str(e)}")
         return ""
 
-# 3. Загрузка и обработка EPUB-файлов
-def load_epub_dataset():
+def load_dataset():
     chunks = []
-    
-    epub_files = [f for f in os.listdir(EPUB_DIR) if f.lower().endswith('.epub')]
-    if not epub_files:
-        raise FileNotFoundError(f"В папке {EPUB_DIR} не найдено EPUB-файлов!")
-    
-    print(f"Найдено {len(epub_files)} EPUB-файлов для обработки")
-    
-    for filename in epub_files:
-        filepath = os.path.join(EPUB_DIR, filename)
-        print(f"Обработка: {filename}")
-        
+    supported_files = []
+
+    for root, _, files in os.walk(INPUT_DIR):
+        for f in files:
+            if f.lower().endswith('.epub'):
+                supported_files.append(os.path.join(root, f))
+
+    if not supported_files:
+        available_files = "\n".join(os.listdir(INPUT_DIR))
+        raise FileNotFoundError(
+            f"В папке {INPUT_DIR} не найдено EPUB файлов!\n"
+            f"Доступные файлы:\n{available_files}"
+        )
+
+    print(f"\nНайдено {len(supported_files)} EPUB файлов для обработки")
+
+    for filepath in supported_files:
+        print(f"\nОбработка: {os.path.basename(filepath)}")
         text = epub_to_text(filepath)
+        
         if not text:
-            print(f"  Пропущен (пустой текст): {filename}")
+            print(f"  Пропущен (пустой текст)")
             continue
-            
+
         for i in range(0, len(text), CHUNK_SIZE):
             chunk = text[i:i+CHUNK_SIZE]
-            if len(chunk) > 100:
+            if len(chunk) > 50:
                 chunks.append({"text": chunk})
-                
+
             if len(chunks) >= MAX_SAMPLES:
                 break
-                
+
         print(f"  Добавлено фрагментов: {min(len(text)//CHUNK_SIZE, MAX_SAMPLES - len(chunks))}")
-        
+        print(f"  Всего фрагментов: {len(chunks)}")
+
         if len(chunks) >= MAX_SAMPLES:
-            print(f"Достигнут максимум в {MAX_SAMPLES} фрагментов")
+            print(f"\nДостигнут максимум в {MAX_SAMPLES} фрагментов")
             break
-        if sys.getsizeof(chunks) > 1_000_000_000:
-            print(f"Превышен лимит памяти. Используется первых {len(chunks)//2} фрагментов")
 
-    print(f"Итого создано {len(chunks)} текстовых фрагментов")
-    return Dataset.from_list(chunks)
+    print(f"\nИтого создано {len(chunks)} текстовых фрагментов")
+    return Dataset.from_list(chunks[:MAX_SAMPLES])
 
-# 4. Загрузка токенизатора (изменили модель)
-print("\nЗагрузка токенизатора...")
+print("\n=== Загрузка данных ===")
+dataset = load_dataset()
+clear_memory()
+
+print("\n=== Токенизация данных ===")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-tokenizer.pad_token = tokenizer.eos_token 
-
-# 5. Подготовка датасета (без изменений)
-print("\nПодготовка датасета...")
-dataset = load_epub_dataset()
+tokenizer.pad_token = tokenizer.eos_token
 
 def tokenize_function(examples):
     tokenized = tokenizer(
         examples["text"],
-        truncation=True,
-        max_length=256,
         padding="max_length",
-        return_tensors="pt"
+        truncation=True,
+        max_length=CHUNK_SIZE,
     )
-    tokenized["labels"] = tokenized["input_ids"].clone() 
+    tokenized["labels"] = tokenized["input_ids"].copy()
     return tokenized
 
-tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
+tokenized_dataset = dataset.map(
+    tokenize_function,
+    batched=True,
+    batch_size=4,
+    remove_columns=["text"],
+)
+clear_memory()
 
-
-# 6. Конфигурация Quantization
-quant_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.float16,
-    bnb_4bit_use_double_quant=False
+print("\n=== Инициализация модели ===")
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    torch_dtype=torch.float16,
 )
 
-# 7. Загрузка модели
-print(f"\nЗагрузка модели {MODEL_NAME}...")
-model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, device_map="auto")
+model = model.to(DEVICE)
+model.gradient_checkpointing_enable()
+model.config.use_cache = False
 
-# 8. Настройка LoRA для GPT-3
 peft_config = LoraConfig(
     r=8,
-    lora_alpha=32,
-    target_modules=[
-        "c_attn", 
-        "c_proj",  
-        "c_fc",    
-        "mlp.c_proj" 
-    ],
+    lora_alpha=16,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
     lora_dropout=0.05,
     bias="none",
     task_type="CAUSAL_LM"
@@ -173,47 +205,213 @@ peft_config = LoraConfig(
 
 model = get_peft_model(model, peft_config)
 model.print_trainable_parameters()
+clear_memory()
 
-# 9. Параметры обучения
+print("\n=== Настройка обучения ===")
+
+from transformers import TrainingArguments, Trainer, EarlyStoppingCallback
+from rouge_score import rouge_scorer
+from nltk.translate.bleu_score import corpus_bleu
+from collections import Counter
+import math
+
+class RougeMetrics:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+    
+    def compute(self, preds, refs):
+        scores = []
+        for pred, ref in zip(preds, refs):
+            scores.append(self.scorer.score(ref, pred))
+        return {
+            'rouge1': np.mean([s['rouge1'].fmeasure for s in scores]),
+            'rouge2': np.mean([s['rouge2'].fmeasure for s in scores]),
+            'rougeL': np.mean([s['rougeL'].fmeasure for s in scores])
+        }
+
+class NGramMetrics:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+    
+    def compute(self, preds, refs):
+        refs = [[ref.split()] for ref in refs]
+        preds = [pred.split() for pred in preds]
+        bleu = corpus_bleu(refs, preds)
+        
+        word_counts = Counter()
+        for pred in preds:
+            word_counts.update(pred)
+        perplexity = math.exp(-sum(math.log(word_counts[word]/sum(word_counts.values())) 
+                            for word in word_counts)/len(word_counts))
+        
+        return {'bleu': bleu, 'perplexity': perplexity}
+
+class ExistentialTrainer(Trainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.tokenizer = tokenizer
+        self.rouge = RougeMetrics(tokenizer)
+        self.ngram = NGramMetrics(tokenizer)
+        self.last_metrics = {}
+        self.metrics_file = os.path.join(self.args.output_dir, "training_metrics.json")
+        self._load_metrics()
+        
+    def compute_metrics(self, eval_preds):
+        try:
+            preds, labels = eval_preds
+            
+            # Заменяем -100 (игнорируемые токены) на pad_token_id
+            labels = np.where(labels != -100, labels, self.tokenizer.pad_token_id)
+            
+            # Декодируем с учетом особых случаев
+            decoded_preds = self.tokenizer.batch_decode(
+                preds, 
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=True
+            )
+            decoded_labels = self.tokenizer.batch_decode(
+                labels,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=True
+            )
+            
+            # Фильтруем пустые строки
+            decoded_preds = [p.strip() for p in decoded_preds if p.strip()]
+            decoded_labels = [l.strip() for l in decoded_labels if l.strip()]
+            
+            if not decoded_preds or not decoded_labels:
+                return {"rouge1": 0.0, "rougeL": 0.0, "bleu": 0.0}
+            
+            # Вычисляем метрики
+            metrics = {
+                **self.rouge.compute(decoded_preds, decoded_labels),
+                **self.ngram.compute(decoded_preds, decoded_labels)
+            }
+            
+            # Добавляем примеры для отладки (первые 3 образца)
+            metrics['samples'] = list(zip(decoded_labels[:3], decoded_preds[:3]))
+            
+            return metrics
+            
+        except Exception as e:
+            print(f"Ошибка при вычислении метрик: {str(e)}")
+            return {"rouge1": 0.0, "rougeL": 0.0, "bleu": 0.0, "error": str(e)}
+    
+    def _load_metrics(self):
+        if os.path.exists(self.metrics_file):
+            try:
+                with open(self.metrics_file, "r") as f:
+                    self.last_metrics = json.load(f)
+                print(f"Загружены сохраненные метрики из {self.metrics_file}")
+            except Exception as e:
+                print(f"Ошибка загрузки метрик: {str(e)}")
+
+    def _save_metrics(self, metrics: Dict[str, Any]):
+        try:
+            with open(self.metrics_file, "w") as f:
+                json.dump(metrics, f, indent=2)
+            self.last_metrics = metrics
+        except Exception as e:
+            print(f"Ошибка сохранения метрик: {str(e)}")
+
+    def safe_evaluate(self):
+        try:
+            metrics = self.evaluate()
+            self._save_metrics(metrics)
+            return metrics
+        except Exception as e:
+            print(f"\n⚠️ Ошибка при вычислении метрик: {str(e)}")
+            print(f"Используем последние сохраненные метрики")
+            return self.last_metrics or {"error": "No metrics available"}
+
+data_collator = DataCollatorForLanguageModeling(
+    tokenizer=tokenizer,
+    mlm=False,
+    pad_to_multiple_of=8
+)
+
+train_size = int(0.9 * len(tokenized_dataset))
+eval_size = len(tokenized_dataset) - train_size
+train_dataset = tokenized_dataset.select(range(train_size))
+eval_dataset = tokenized_dataset.select(range(train_size, train_size + eval_size))
+
 training_args = TrainingArguments(
-    output_dir="./rugpt3small-trained",
-    per_device_train_batch_size=2,
-    gradient_accumulation_steps=2,
-    num_train_epochs=3,
-    learning_rate=2e-5,
+    output_dir=os.path.join(OUTPUT_DIR, "results"),
+    per_device_train_batch_size=BATCH_SIZE,
+    gradient_accumulation_steps=GRAD_ACCUM_STEPS,
+    per_device_eval_batch_size=1,
+    eval_accumulation_steps=1,
     optim="adamw_torch",
-    logging_steps=10,
-    save_strategy="steps",
-    save_steps=200,
+    fp16=True,
+    fp16_full_eval=True,
+    logging_steps=20,
+    save_steps=500,
+    learning_rate=5e-5,
+    max_grad_norm=0.3,
+    eval_strategy="steps",
+    eval_steps=100,
+    bf16=False,
+    tf32=False,
+    num_train_epochs=2,
+    weight_decay=0.01,
+    gradient_checkpointing=True,
+    save_total_limit=2,
     report_to="none",
-    remove_unused_columns=False,
-    fp16=True if torch.cuda.is_available() else False
+    max_steps=2000,
+    load_best_model_at_end=True,
+    metric_for_best_model="eval_loss",
+    greater_is_better=False,
+    ddp_find_unused_parameters=False,
+    remove_unused_columns=True,
+    label_names=["labels"],
+    dataloader_pin_memory=True,
+    dataloader_num_workers=1,
+    no_cuda=not torch.cuda.is_available(),
+    use_cpu=not torch.cuda.is_available(),
+    local_rank=-1
 )
 
-# 10. Запуск обучения
-trainer = Trainer(
+def print_metrics(metrics):
+    print("\n=== Final Metrics ===")
+    print(f"Training Loss: {metrics.get('train_loss', 0.0):.4f}")
+    print(f"Validation Loss: {metrics.get('eval_loss', 0.0):.4f}")
+    print("\nGeneration Quality:")
+    print(f"ROUGE-1: {metrics.get('rouge1', 0):.3f}")
+    print(f"ROUGE-L: {metrics.get('rougeL', 0):.3f}")
+    print(f"BLEU: {metrics.get('bleu', 0):.3f}")
+    
+    if 'samples' in metrics:
+        print("\nGeneration Samples:")
+        for i, (ref, pred) in enumerate(metrics['samples']):
+            print(f"\nSample {i+1}:")
+            print(f"Reference: {ref[:200]}{'...' if len(ref) > 200 else ''}")
+            print(f"Generated: {pred[:200]}{'...' if len(pred) > 200 else ''}")
+
+trainer = ExistentialTrainer(
     model=model,
+    tokenizer=tokenizer,
     args=training_args,
-    train_dataset=tokenized_dataset,
+    train_dataset=train_dataset,
+    eval_dataset=eval_dataset,
+    data_collator=data_collator,
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=3, early_stopping_threshold=0.1)]
 )
 
-print("\nСтарт обучения модели...")
-trainer.train()
+try:
+    print("Начало обучения...")
+    trainer.train()
+    final_metrics = trainer.safe_evaluate()
+    print_metrics(final_metrics)
+except Exception as e:
+    print(f"\n⚠️ Произошла ошибка: {str(e)}")
+    print("Попытка восстановить последние метрики...")
+    final_metrics = trainer.last_metrics or {"error": "No metrics available"}
+    print_metrics(final_metrics)
+finally:
+    trainer.save_model(os.path.join(OUTPUT_DIR, "results"))
+    print("\nМодель сохранена в безопасном режиме")
 
-# 11. Сохранение
-model.save_pretrained("./rugpt3small-trained")
-tokenizer.save_pretrained("./rugpt3small-trained")
-print("Модель сохранена в './rugpt3small-trained'")
-
-# 12. Тестирование
-input_text = "В чём смысл жизни?"
-inputs = tokenizer(input_text, return_tensors="pt").to("cuda" if torch.cuda.is_available() else "cpu")
-outputs = model.generate(
-    **inputs,
-    max_new_tokens=50,
-    temperature=0.7,
-    do_sample=True,
-    pad_token_id=tokenizer.eos_token_id
-)
-print("\nРезультат генерации:")
-print(tokenizer.decode(outputs[0], skip_special_tokens=True))
+print("\n=== Обучение завершено ===")
+print("Сохраненные файлы:", os.listdir(os.path.join(OUTPUT_DIR, "results")))
+clear_memory()
