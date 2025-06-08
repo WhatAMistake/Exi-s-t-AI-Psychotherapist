@@ -2,6 +2,17 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import re
 import random
 
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+try:
+    model_path = "/kaggle/working/results"
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    model = AutoModelForCausalLM.from_pretrained(model_path).to(device)
+    print("Модель успешно подгрузилась")
+except Exception as e:
+    print(f"Ошибка загрузки: {e}")
+    exit()
+
 # Библиотека терапевтических техник
 TECHNIQUES = {
     "одиночество": [
@@ -80,5 +91,5 @@ def generate_natural_response(user_input):
 
 # Пример использования
 user_input = "Я чувствую ледяную пустоту внутри"
-response = generate_natural_response(user_input)
+response = 'Exi(s)t:' + generate_natural_response(user_input)
 print(response)
